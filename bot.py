@@ -1,26 +1,29 @@
 """
-Professional Expense Management Telegram Bot
-Render-ready with webhook support (no sleep issues)
+Professional Expense Manager Bot - Render Webhook Ready
+Uses python-telegram-bot v20 custom webhook pattern
 """
 
 import logging
-import sqlite3
 import os
+import sqlite3
 import asyncio
 from datetime import datetime
 from typing import List, Tuple
+from http import HTTPStatus
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
+
 from flask import Flask, request, Response
-import threading
+from asgiref.wsgi import WsgiToAsgi
+import uvicorn
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-PORT = int(os.environ.get("PORT", 5000))
+PORT = int(os.environ.get("PORT", 10000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 DB_PATH = "expenses.db"
 
@@ -486,15 +489,18 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return MENU
 
-# ─── Error Handler ───────────────────────────────────────────────────────────
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-
-# ─── Build Application ───────────────────────────────────────────────────────
-def build_application():
+# ─── Build PTB Application (NO Updater - webhook only) ──────────────────────
+def build_ptb_application():
     init_db()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # CRITICAL: .updater(None) disables the internal Updater
+    # We handle updates via Flask webhook instead
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .updater(None)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -525,55 +531,62 @@ def build_application():
     )
 
     application.add_handler(conv_handler)
-    application.add_error_handler(error_handler)
 
     return application
 
-# ─── Flask Web Server (for Render webhook) ───────────────────────────────────
+# ─── Flask Web App ───────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
-application = build_application()
+ptb_app = build_ptb_application()
 
 @flask_app.route('/')
 def health_check():
     return "✅ Bot is running!", 200
 
 @flask_app.route('/webhook', methods=['POST'])
-def webhook():
+async def webhook():
     """Receive updates from Telegram"""
     if request.method == 'POST':
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        application.update_queue.put_nowait(update)
+        update = Update.de_json(request.get_json(force=True), ptb_app.bot)
+        await ptb_app.update_queue.put(update)
         return Response('ok', status=200)
     return Response('ok', status=200)
 
 @flask_app.route('/set_webhook', methods=['GET'])
-def set_webhook():
+async def set_webhook():
     """Set webhook URL (call once after deploy)"""
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        application.bot.set_webhook(url=webhook_url)
+        await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
         return f"Webhook set to: {webhook_url}", 200
     return "RENDER_EXTERNAL_URL not set", 400
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-def main():
-    # Start the bot application in background
-    async def start_bot():
-        async with application:
-            await application.start()
-            # Keep running
-            while True:
-                await asyncio.sleep(3600)
+async def main():
+    """Run PTB application and webserver together"""
 
-    # Run bot in a separate thread
-    def run_bot():
-        asyncio.run(start_bot())
+    # Set webhook on startup if URL is available
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        await ptb_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Webhook set to: {webhook_url}")
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Wrap Flask with ASGI adapter for uvicorn
+    asgi_app = WsgiToAsgi(flask_app)
 
-    # Start Flask server
-    flask_app.run(host='0.0.0.0', port=PORT)
+    # Configure uvicorn server
+    config = uvicorn.Config(
+        app=asgi_app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+
+    # Run PTB and webserver together
+    async with ptb_app:
+        await ptb_app.start()
+        await server.serve()
+        await ptb_app.stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
